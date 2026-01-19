@@ -1,5 +1,3 @@
-import { motion } from 'framer-motion'
-import { Button } from '@/components/ui/button'
 import { useState } from 'react'
 
 const API_BASE = "http://localhost:8000"
@@ -9,59 +7,13 @@ function App() {
   const [displayName, setDisplayName] = useState("");
   const [userId, setUserId] = useState("");
 
-  // Helpers to convert between base64url strings and ArrayBuffers for WebAuthn
-  function b64urlToUint8(b64url) {
-    const base64 = b64url
-      .replace(/-/g, '+')
-      .replace(/_/g, '/')
-      .padEnd(Math.ceil(b64url.length / 4) * 4, '=');
-    const binary = atob(base64);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-    return bytes;
-  }
-
-  function arrayBufferToB64url(buf) {
-    const bytes = new Uint8Array(buf);
-    let binary = '';
-    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
-    const base64 = btoa(binary);
-    return base64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
-  }
-
-  function prepareCreationOptions(ccr) {
-    // Convert challenge, user.id, and excludeCredentials[].id to ArrayBuffers
-    const pk = ccr.publicKey ?? ccr; // some servers nest under publicKey
-    return {
-      ...pk,
-      challenge: b64urlToUint8(pk.challenge),
-      user: {
-        ...pk.user,
-        id: b64urlToUint8(pk.user.id),
-      },
-      excludeCredentials: (pk.excludeCredentials || []).map((c) => ({
-        ...c,
-        id: b64urlToUint8(c.id),
-      })),
-    };
-  }
-
-  function credentialToJSON(cred) {
-    const resp = cred.response;
-    return {
-      id: cred.id,
-      type: cred.type,
-      rawId: arrayBufferToB64url(cred.rawId),
-      response: {
-        attestationObject: arrayBufferToB64url(resp.attestationObject),
-        clientDataJSON: arrayBufferToB64url(resp.clientDataJSON),
-      },
-      clientExtensionResults: cred.getClientExtensionResults?.() || {},
-    };
-  }
+  const toBuf = (s) => Uint8Array.from(atob(s.replace(/-/g, '+').replace(/_/g, '/').padEnd(Math.ceil(s.length / 4) * 4, '=')), c => c.charCodeAt(0));
+  const toB64url = (buf) => {
+    const bin = String.fromCharCode(...new Uint8Array(buf));
+    return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+  };
 
   async function handleRegister() {
-    // 1) Start on backend
     const startRes = await fetch(API_BASE + "/register/start", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -70,13 +22,25 @@ function App() {
     const startData = await startRes.json();
     const { user_id, ccr } = startData;
     setUserId(user_id);
-
-    // 2) Prepare options and create credential
-    const publicKey = prepareCreationOptions(ccr);
+    const pkCreate = ccr.publicKey ?? ccr;
+    const publicKey = {
+      ...pkCreate,
+      challenge: toBuf(pkCreate.challenge),
+      user: { ...pkCreate.user, id: toBuf(pkCreate.user.id) },
+      excludeCredentials: (pkCreate.excludeCredentials || []).map(c => ({ ...c, id: toBuf(c.id) })),
+    };
     const credential = await navigator.credentials.create({ publicKey });
-
-    // 3) Serialize and finish on backend
-    const response = credentialToJSON(credential);
+    const respCreate = credential.response;
+    const response = {
+      id: credential.id,
+      type: credential.type,
+      rawId: toB64url(credential.rawId),
+      response: {
+        attestationObject: toB64url(respCreate.attestationObject),
+        clientDataJSON: toB64url(respCreate.clientDataJSON),
+      },
+      clientExtensionResults: credential.getClientExtensionResults?.() || {},
+    };
     const finishRes = await fetch(API_BASE + "/register/finish", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -85,60 +49,93 @@ function App() {
     const finishData = await finishRes.json();
     console.log('registration finish:', finishData);
   }
-function handleGet() {
-  navigator.credentials.get({
-    publicKey: {
-      challenge: new Uint8Array([139, 66, 181, 87, 7, 203 /* … */]),
-      rpId: "localhost",
-      allowCredentials: [
-        {
-          type: "public-key",
-          id: new Int8Array([37, 125, 70, 73, -77, -77, -36, 26, 75, -120, -25, -110, -88, -67, -91, -8]),
-        },
-      ],
-      userVerification: "required",
+async function handleAuth() {
+  if (!userId) return;
+  const startRes = await fetch(API_BASE + "/auth/start", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ user_id: userId }),
+  });
+  const startData = await startRes.json();
+  const { rcr } = startData;
+  const pkGet = rcr.publicKey ?? rcr;
+  const publicKey = {
+    ...pkGet,
+    challenge: toBuf(pkGet.challenge),
+    allowCredentials: (pkGet.allowCredentials || []).map(c => ({ ...c, id: toBuf(c.id) })),
+  };
+  const assertion = await navigator.credentials.get({ publicKey });
+  const respGet = assertion.response;
+  const response = {
+    id: assertion.id,
+    type: assertion.type,
+    rawId: toB64url(assertion.rawId),
+    response: {
+      authenticatorData: toB64url(respGet.authenticatorData),
+      clientDataJSON: toB64url(respGet.clientDataJSON),
+      signature: toB64url(respGet.signature),
+      userHandle: respGet.userHandle ? toB64url(respGet.userHandle) : null,
     },
-  })
-    .then((val) => console.log('val get: ', val))
-}
-// keep handleCreate only if needed elsewhere; registration path now uses conversions above
-async function handleCreate(val) {
-  const cpk = await navigator.credentials.create(val)
-  console.log('cpk: ', cpk)
-  return cpk
+    clientExtensionResults: assertion.getClientExtensionResults?.() || {},
+  };
+  const finishRes = await fetch(API_BASE + "/auth/finish", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ user_id: userId, auth: response }),
+  });
+  const finishData = await finishRes.json();
+  console.log('authentication finish:', finishData);
 }
 return (
-  <div className="min-h-screen bg-background text-foreground">
-    <div className="mx-auto flex min-h-screen w-full max-w-5xl items-center justify-center p-6">
-      <input type='text' placeholder='username' value={username} onChange={(e) => setUsername(e.target.value)} />
-      <input type='text' value={displayName} placeholder='display name' onChange={(e) => setDisplayName(e.target.value)} />
-      <button onClick={handleRegister}>click to create auth</button>
-      {/* <button onClick={handleGet}>click to get auth</button> */}
-      {/* <motion.div
-        initial={{ opacity: 0, y: 16 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ duration: 0.6, ease: 'easeOut' }}
-        className="w-full max-w-xl space-y-6 rounded-2xl border bg-card p-8 shadow-sm"
+<div className="mx-auto w-full max-w-md rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
+  <h2 className="mb-1 text-xl font-semibold text-slate-900">Create account</h2>
+  <p className="mb-6 text-sm text-slate-600">Enter a username and display name.</p>
+
+  <div className="space-y-4">
+    <div>
+      <label className="mb-1 block text-sm font-medium text-slate-700">
+        Username
+      </label>
+      <input
+        type="text"
+        placeholder="username"
+        value={username}
+        onChange={(e) => setUsername(e.target.value)}
+        className="w-full rounded-xl border border-slate-300 bg-white px-4 py-2.5 text-slate-900 placeholder:text-slate-400 shadow-sm outline-none transition focus:border-indigo-500 focus:ring-4 focus:ring-indigo-500/15"
+      />
+    </div>
+
+    <div>
+      <label className="mb-1 block text-sm font-medium text-slate-700">
+        Display name
+      </label>
+      <input
+        type="text"
+        placeholder="display name"
+        value={displayName}
+        onChange={(e) => setDisplayName(e.target.value)}
+        className="w-full rounded-xl border border-slate-300 bg-white px-4 py-2.5 text-slate-900 placeholder:text-slate-400 shadow-sm outline-none transition focus:border-indigo-500 focus:ring-4 focus:ring-indigo-500/15"
+      />
+    </div>
+
+    <div className="grid grid-cols-1 gap-3 pt-2 sm:grid-cols-2">
+      <button
+        onClick={handleRegister}
+        className="inline-flex items-center justify-center rounded-xl bg-indigo-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-indigo-700 active:scale-[0.99] focus:outline-none focus:ring-4 focus:ring-indigo-500/20 disabled:cursor-not-allowed disabled:opacity-60"
       >
-        <div className="space-y-2">
-          <p className="text-xs font-semibold uppercase tracking-[0.3em] text-muted-foreground">
-            RustKey starter
-          </p>
-          <h1 className="text-3xl font-semibold">
-            React, Framer Motion, and shadcn/ui
-          </h1>
-          <p className="text-sm text-muted-foreground">
-            This baseline is ready for layout, motion, and component work. Drop
-            in your UI ideas and start shipping.
-          </p>
-        </div>
-        <div className="flex flex-wrap gap-3">
-          <Button>Get started</Button>
-          <Button variant="outline">View components</Button>
-        </div>
-      </motion.div> */}
+        Create auth
+      </button>
+
+      <button
+        onClick={handleAuth}
+        className="inline-flex items-center justify-center rounded-xl border border-slate-300 bg-white px-4 py-2.5 text-sm font-semibold text-slate-900 shadow-sm transition hover:bg-slate-50 active:scale-[0.99] focus:outline-none focus:ring-4 focus:ring-slate-400/20 disabled:cursor-not-allowed disabled:opacity-60"
+      >
+        Get auth
+      </button>
     </div>
   </div>
+</div>
+  
 )
 }
 export default App
